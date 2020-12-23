@@ -45,11 +45,14 @@ options:
         description:
           - The task definition the service will run.
           - This parameter is required when I(state=present).
+          - This parameter is ignored when updating a service with deployment controller is CODE_DEPLOY. The task definition is managed by Code Pipeline in that case and cannot be updated.
         required: false
         type: str
     load_balancers:
         description:
           - The list of ELBs defined for this service.
+          - Load balancers for an existing service cannot be updated, and it is an error to do so.
+          - When the deployment controller is CODE_DEPLOY changes to this value are simply ignored, and do not cause an error.
         required: false
         type: list
         elements: dict
@@ -89,6 +92,16 @@ options:
         required: false
         type: bool
         default: false
+    deployment_controller:
+        description:
+          - The deployment controller to use for the service. If no deploymenet controller is specified, the ECS controller is used.
+        required: false
+        type: dict
+        suboptions:
+          type:
+            type: str
+            choices: ["ECS", "CODE_DEPLOY", "EXTERNAL"]
+            description: The deployment controller type to use.
     deployment_configuration:
         description:
           - Optional parameters that control the deployment_configuration.
@@ -129,6 +142,12 @@ options:
           field:
             description: The field to apply the placement strategy against.
             type: str
+    platform_version:
+        description:
+          - The platform version on which your tasks in the service are running. A platform version is only specified for tasks using the Fargate launch type. If one is not specified, the default version is used. This might not be the very latest version.
+          - Examples: 1.3.0 or 1.4.0.
+        required: false
+        type: str
     network_configuration:
         description:
           - Network configuration of the service. Only applicable for task definitions created with I(network_mode=awsvpc).
@@ -473,6 +492,10 @@ ansible_facts:
 '''
 import time
 
+DEPLOYMENT_CONTROLLER_TYPE_MAP = {
+    'type': 'str',
+}
+
 DEPLOYMENT_CONFIGURATION_TYPE_MAP = {
     'maximum_percent': 'int',
     'minimum_healthy_percent': 'int'
@@ -545,7 +568,8 @@ class EcsServiceManager:
 
     def is_matching_service(self, expected, existing):
         if expected['task_definition'] != existing['taskDefinition']:
-            return False
+            if existing['deploymentController']['type'] != 'CODE_DEPLOY':
+                return False
 
         if (expected['load_balancers'] or []) != existing['loadBalancers']:
             return False
@@ -558,18 +582,20 @@ class EcsServiceManager:
 
         return True
 
-    def create_service(self, service_name, cluster_name, task_definition, load_balancers,
-                       desired_count, client_token, role, deployment_configuration,
+    def create_service(self, service_name, cluster_name, platform_version, task_definition, load_balancers,
+                       desired_count, client_token, role, deployment_controller, deployment_configuration,
                        placement_constraints, placement_strategy, health_check_grace_period_seconds,
                        network_configuration, service_registries, launch_type, scheduling_strategy):
 
         params = dict(
             cluster=cluster_name,
             serviceName=service_name,
+            platformVersion=platform_version,
             taskDefinition=task_definition,
             loadBalancers=load_balancers,
             clientToken=client_token,
             role=role,
+            deploymentController=deployment_controller,
             deploymentConfiguration=deployment_configuration,
             placementConstraints=placement_constraints,
             placementStrategy=placement_strategy
@@ -649,6 +675,7 @@ def main():
         state=dict(required=True, choices=['present', 'absent', 'deleting']),
         name=dict(required=True, type='str'),
         cluster=dict(required=False, type='str'),
+        platform_version=dict(required=False, type='str'),
         task_definition=dict(required=False, type='str'),
         load_balancers=dict(required=False, default=[], type='list', elements='dict'),
         desired_count=dict(required=False, type='int'),
@@ -657,6 +684,7 @@ def main():
         delay=dict(required=False, type='int', default=10),
         repeat=dict(required=False, type='int', default=10),
         force_new_deployment=dict(required=False, default=False, type='bool'),
+        deployment_controller=dict(required=False, default={}, type='dict'),
         deployment_configuration=dict(required=False, default={}, type='dict'),
         placement_constraints=dict(
             required=False,
@@ -706,6 +734,11 @@ def main():
         network_configuration = service_mgr.format_network_configuration(module.params['network_configuration'])
     else:
         network_configuration = None
+
+    deployment_controller = map_complex_type(module.params['deployment_controller'],
+                                                DEPLOYMENT_CONTROLLER_TYPE_MAP)
+
+    deploymentController = snake_dict_to_camel_dict(deployment_controller)
 
     deployment_configuration = map_complex_type(module.params['deployment_configuration'],
                                                 DEPLOYMENT_CONFIGURATION_TYPE_MAP)
@@ -776,12 +809,19 @@ def main():
                             module.fail_json(msg="It is not possible to update the service registries of an existing service")
 
                     if (existing['loadBalancers'] or []) != loadBalancers:
-                        module.fail_json(msg="It is not possible to update the load balancers of an existing service")
+                        if existing['deploymentController']['type'] != 'CODE_DEPLOY':
+                            module.fail_json(msg="It is not possible to update the load balancers of an existing service")
+
+                    if existing['deploymentController']['type'] == 'CODE_DEPLOY':
+                        task_definition = '';
+                        network_configuration = [];
+                    else:
+                        task_definition = module.params['task_definition'];
 
                     # update required
                     response = service_mgr.update_service(module.params['name'],
                                                           module.params['cluster'],
-                                                          module.params['task_definition'],
+                                                          task_definition,
                                                           module.params['desired_count'],
                                                           deploymentConfiguration,
                                                           network_configuration,
@@ -792,11 +832,13 @@ def main():
                     try:
                         response = service_mgr.create_service(module.params['name'],
                                                               module.params['cluster'],
+                                                              module.params['platform_version'],
                                                               module.params['task_definition'],
                                                               loadBalancers,
                                                               module.params['desired_count'],
                                                               clientToken,
                                                               role,
+                                                              deploymentController,
                                                               deploymentConfiguration,
                                                               module.params['placement_constraints'],
                                                               module.params['placement_strategy'],
